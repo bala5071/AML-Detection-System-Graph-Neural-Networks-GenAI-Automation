@@ -6,14 +6,6 @@ from sklearn.preprocessing import LabelEncoder
 
 class Dataset(InMemoryDataset):
     def __init__(self, root, transform=None, pre_transform=None):
-        """
-        Args:
-            root (str): Root directory where the dataset should be saved.
-            transform (callable, optional): A function/transform that takes in an
-                torch_geometric.data.Data object and returns a transformed version.
-            pre_transform (callable, optional): A function/transform that takes in
-                an torch_geometric.data.Data object and returns a transformed version.
-        """
         super().__init__(root, transform, pre_transform)
         self.data, self.slices = torch.load(self.processed_paths[0], weights_only=False)
 
@@ -27,9 +19,6 @@ class Dataset(InMemoryDataset):
 
 
     def get_all_account(self, df):
-        """
-        Creates a unified dataframe of all unique accounts (nodes) and their labels.
-        """
         ldf = df[['Account', 'From Bank']]
         rdf = df[['Account.1', 'To Bank']]
 
@@ -52,11 +41,6 @@ class Dataset(InMemoryDataset):
         return all_accounts
 
     def calculate_unique_counterparties(self, df, accounts_df):
-        """
-        FEATURE ENGINEERING: Calculates the number of unique counterparties 
-        (degree centrality) for each account.
-        """
-
         out_degree = df.groupby('Account')['Account.1'].nunique()
  
         in_degree = df.groupby('Account.1')['Account'].nunique()
@@ -93,22 +77,40 @@ class Dataset(InMemoryDataset):
         node_df = self.get_all_account(df)
         
         node_df = self.calculate_unique_counterparties(df, node_df)
+        
+
+
+        out_txn_count = df.groupby('Account').size()
+        in_txn_count = df.groupby('Account.1').size()
+
+        node_df['out_txn_count'] = node_df['Account'].map(out_txn_count).fillna(0)
+        node_df['in_txn_count'] = node_df['Account'].map(in_txn_count).fillna(0)
+
+        out_amount_sum = df.groupby('Account')['Amount Paid'].sum()
+        in_amount_sum = df.groupby('Account.1')['Amount Received'].sum()
+
+        node_df['out_amount_sum'] = node_df['Account'].map(out_amount_sum).fillna(0)
+        node_df['in_amount_sum'] = node_df['Account'].map(in_amount_sum).fillna(0)
+
+        node_df['flow_imbalance'] = (
+            node_df['out_amount_sum'] - node_df['in_amount_sum']
+        )
+
+        for col in [
+            'out_txn_count', 'in_txn_count',
+            'out_amount_sum', 'in_amount_sum',
+            'flow_imbalance'
+        ]:
+            node_df[col] = np.log1p(node_df[col].abs())
+        
 
         currency_ls = sorted(df['Receiving Currency'].unique())
         paying_df = df[['Account', 'Amount Paid', 'Payment Currency']]
         receiving_df = df[['Account.1', 'Amount Received', 'Receiving Currency']].rename({'Account.1': 'Account'}, axis=1)
-
-        for i in currency_ls:
- 
-            temp_p = paying_df[paying_df['Payment Currency'] == i]
-            node_df['avg_paid_' + str(i)] = temp_p['Amount Paid'].groupby(temp_p['Account']).transform('mean')
-
-            temp_r = receiving_df[receiving_df['Receiving Currency'] == i]
-            node_df['avg_received_' + str(i)] = temp_r['Amount Received'].groupby(temp_r['Account']).transform('mean')
         
         node_df = node_df.fillna(0)
+        node_df = node_df.drop(columns=['Bank'])
 
-        node_df['Bank'] = le.fit_transform(node_df['Bank'].astype(str))
 
         y = torch.from_numpy(node_df['Is Laundering'].values).long()
 
@@ -125,6 +127,7 @@ class Dataset(InMemoryDataset):
             torch.from_numpy(df['Dst'].values)
         ], dim=0).long()
         df['Log Amount'] = np.log1p(df['Amount Paid'])
+
         edge_attr_cols = [
             'Timestamp_Norm', 
             'Amount Received', 
@@ -137,7 +140,13 @@ class Dataset(InMemoryDataset):
         ]
         
         edge_attr = torch.from_numpy(df[edge_attr_cols].values).float()
-        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
+        log_amount = edge_attr[:, 6]
+        mean = log_amount.mean()
+        std = log_amount.std()
+
+        edge_weight = (log_amount - mean) / (std + 1e-8)
+        edge_weight = edge_weight.clamp(-10, 10)
+        data = Data(x=x, edge_index=edge_index, edge_weight=edge_weight, edge_attr=edge_attr, y=y)
         if self.pre_filter is not None and not self.pre_filter(data):
             return
         if self.pre_transform is not None:
@@ -146,8 +155,4 @@ class Dataset(InMemoryDataset):
         torch.save(self.collate([data]), self.processed_paths[0])
         print("Data processing complete. Saved to data.pt")
 
-if __name__ == "__main__":
-    dataset = Dataset(root='Data')
-    print(f"Dataset created with {dataset[0].num_nodes} nodes and {dataset[0].num_edges} edges.")
-    print(f"Node Feature Shape: {dataset[0].x.shape}")
-    print(f"Edge Feature Shape: {dataset[0].edge_attr.shape}")
+
